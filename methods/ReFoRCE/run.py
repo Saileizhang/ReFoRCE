@@ -5,6 +5,7 @@ from utils import get_table_info, initialize_logger, get_dictionary, get_sqlite_
 from agent import REFORCE
 from chat import GPTChat
 from prompt import Prompts
+from decompose import decompose_task
 import threading, concurrent
 from sql import SqlEnv
 import time
@@ -89,31 +90,14 @@ def process_sql_data(sql_data):
     print(sql_data)
 
     question = task_dict[sql_data]
-    search_directory = os.path.join(args.output_path, sql_data)
+    base_directory = os.path.join(args.output_path, sql_data)
 
-    # Create agent object
-    agent_format = REFORCE(args.db_path, sql_data, search_directory, prompt_all)
-    
-    # Create the directory if it does not exist
-    if not os.path.exists(search_directory):
-        os.makedirs(search_directory)
+    sub_questions = [question]
+    if args.task_decompose:
+        sub_questions = decompose_task(question)
 
-    # Skip processing if results already exist and overwrite is not allowed
-    if os.path.exists(agent_format.complete_sql_save_path) and not args.revote:
-        return
-    
-    if args.overwrite_unfinished:
-        if not os.path.exists(agent_format.complete_sql_save_path):
-            for filename in os.listdir(search_directory):
-                filepath = os.path.join(search_directory, filename)
-                if os.path.isfile(filepath):
-                    os.remove(filepath)
-        else:
-            return
-
-    # Ensure the search directory exists (in case it was removed)
-    if not os.path.exists(search_directory):
-        os.makedirs(search_directory)
+    if not os.path.exists(base_directory):
+        os.makedirs(base_directory)
 
     # sqlite task
     if args.subtask == "sqlite":
@@ -129,72 +113,101 @@ def process_sql_data(sql_data):
             assert res == "0", (sql_data, res)
 
     # Get table information
-    table_info = get_table_info(args.db_path, sql_data, agent_format.api, clear_des=True, full_tb_info=full_tb_info)
+    agent_temp = REFORCE(args.db_path, sql_data, base_directory, prompt_all)
+    table_info = get_table_info(args.db_path, sql_data, agent_temp.api, clear_des=True, full_tb_info=full_tb_info)
     if len(table_info) > 300000:
         print(f"Table info len: {len(table_info)}, return")
 
-    if args.do_format_restriction:
-        if args.use_gold_format:
-            csv_pth = os.path.join("../../spider2-lite/evaluation_suite/gold/exec_result", sql_data+".csv")
-            if not os.path.exists(csv_pth):
-                csv_pth = csv_pth.replace(".csv", "_a.csv")
-            with open(csv_pth) as f:
-                format_csv = "```sql\n"+f.read().split("\n")[0]+"\n```"
-        else:
-            # Initialize sessions at the beginning of each thread
-            chat_session_format = GPTChat(args.azure, args.format_model, temperature=args.temperature)
-            # Format answer and update the pre-chat session
-            format_csv = agent_format.format_answer(question, chat_session_format)
-    else:
-        format_csv = None
+    combined_results = []
 
-    if args.do_vote:
-        num_votes = args.num_votes
-        sql_paths = {}
-        threads = []
+    for idx, sub_q in enumerate(sub_questions):
+        search_directory = base_directory if len(sub_questions) == 1 else os.path.join(base_directory, f"sub{idx}")
+        agent_format = REFORCE(args.db_path, sql_data, search_directory, prompt_all)
 
-        for i in range(num_votes):
-            csv_save_pathi = str(i) + agent_format.csv_save_name
-            log_pathi = str(i) + agent_format.log_save_name
-            sql_save_pathi = str(i) + agent_format.sql_save_name
-            sql_paths[sql_save_pathi] = csv_save_pathi
+        if not os.path.exists(search_directory):
+            os.makedirs(search_directory)
 
-            thread = threading.Thread(
-                target=execute,
-                args=(
-                    question, table_info, args,
-                    csv_save_pathi, log_pathi, sql_save_pathi,
-                    search_directory, format_csv, sql_data
-                )
-            )
-            threads.append(thread)
-            thread.start()
+        if os.path.exists(agent_format.complete_sql_save_path) and not args.revote:
+            continue
 
-        # wait
-        for thread in threads:
-            thread.join()
-        
-        if args.revote:
-            print(search_directory)
-            if "result.sql" in os.listdir(search_directory):
-                print("Revote, remove", os.path.join(search_directory, "result.sql"))
-                os.remove(os.path.join(search_directory, "result.sql"))
-            if "result.csv" in os.listdir(search_directory):
-                print("Revote, remove", os.path.join(search_directory, "result.csv"))
-                os.remove(os.path.join(search_directory, "result.csv"))
-        if "result.sql" not in os.listdir(search_directory):
-            if any(file.endswith('.sql') for file in os.listdir(search_directory) if os.path.isfile(os.path.join(search_directory, file))):
-                # After all processes have completed, perform the vote result
-                agent_format.vote_result(search_directory, args, sql_paths, table_info, question)
+        if args.overwrite_unfinished:
+            if not os.path.exists(agent_format.complete_sql_save_path):
+                for filename in os.listdir(search_directory):
+                    filepath = os.path.join(search_directory, filename)
+                    if os.path.isfile(filepath):
+                        os.remove(filepath)
             else:
-                print(f"{sql_data}: Empty")
-    else:
-        # Directly execute the task
-        execute(
-            question, table_info, args,
-            agent_format.csv_save_name, agent_format.log_save_name, agent_format.sql_save_name,
-            search_directory, format_csv, sql_data
-        )
+                continue
+
+        if not os.path.exists(search_directory):
+            os.makedirs(search_directory)
+
+        if args.do_format_restriction:
+            if args.use_gold_format:
+                csv_pth = os.path.join("../../spider2-lite/evaluation_suite/gold/exec_result", sql_data+".csv")
+                if not os.path.exists(csv_pth):
+                    csv_pth = csv_pth.replace(".csv", "_a.csv")
+                with open(csv_pth) as f:
+                    format_csv = "```sql\n"+f.read().split("\n")[0]+"\n```"
+            else:
+                chat_session_format = GPTChat(args.azure, args.format_model, temperature=args.temperature)
+                format_csv = agent_format.format_answer(sub_q, chat_session_format)
+        else:
+            format_csv = None
+
+        if args.do_vote:
+            num_votes = args.num_votes
+            sql_paths = {}
+            threads = []
+
+            for i in range(num_votes):
+                csv_save_pathi = str(i) + agent_format.csv_save_name
+                log_pathi = str(i) + agent_format.log_save_name
+                sql_save_pathi = str(i) + agent_format.sql_save_name
+                sql_paths[sql_save_pathi] = csv_save_pathi
+
+                thread = threading.Thread(
+                    target=execute,
+                    args=(
+                        sub_q, table_info, args,
+                        csv_save_pathi, log_pathi, sql_save_pathi,
+                        search_directory, format_csv, sql_data
+                    )
+                )
+                threads.append(thread)
+                thread.start()
+
+            for thread in threads:
+                thread.join()
+
+            if args.revote:
+                print(search_directory)
+                if "result.sql" in os.listdir(search_directory):
+                    print("Revote, remove", os.path.join(search_directory, "result.sql"))
+                    os.remove(os.path.join(search_directory, "result.sql"))
+                if "result.csv" in os.listdir(search_directory):
+                    print("Revote, remove", os.path.join(search_directory, "result.csv"))
+                    os.remove(os.path.join(search_directory, "result.csv"))
+            if "result.sql" not in os.listdir(search_directory):
+                if any(file.endswith('.sql') for file in os.listdir(search_directory) if os.path.isfile(os.path.join(search_directory, file))):
+                    agent_format.vote_result(search_directory, args, sql_paths, table_info, sub_q)
+                else:
+                    print(f"{sql_data}: Empty")
+        else:
+            execute(
+                sub_q, table_info, args,
+                agent_format.csv_save_name, agent_format.log_save_name, agent_format.sql_save_name,
+                search_directory, format_csv, sql_data
+            )
+
+        result_path = os.path.join(search_directory, agent_format.csv_save_name)
+        if os.path.exists(result_path):
+            with open(result_path) as f:
+                combined_results.append(f.read())
+
+    if len(combined_results) > 1:
+        with open(os.path.join(base_directory, 'combined_results.txt'), 'w') as f:
+            f.write('\n'.join(combined_results))
 
     print(f"Time for {sql_data}: {int((time.time() - start_time) // 60)} min")
 
@@ -220,6 +233,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_iter', type=int, default=5)
     parser.add_argument('--temperature', type=float, default=1)
     parser.add_argument('--early_stop', action="store_true")
+    parser.add_argument('--task_decompose', action="store_true")
 
     parser.add_argument('--do_vote', action="store_true")
     parser.add_argument('--revote', action="store_true")
