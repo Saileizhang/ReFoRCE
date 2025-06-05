@@ -64,6 +64,9 @@ Credentials Setup: Place your `snowflake_credential.json` and `bigquery_credenti
 
 Currently we support GPT Family API.
 
+To split a complex question into multiple subtasks before execution, pass
+the `--task_decompose` flag to `run.py`.
+
 #### Main
 - **Run Snow with OPENAI_API_KEY:**
 ```bash
